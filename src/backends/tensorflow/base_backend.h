@@ -1,4 +1,4 @@
-// Copyright (c) 2018-2019, NVIDIA CORPORATION. All rights reserved.
+// Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions
@@ -90,11 +90,11 @@ class BaseBackend : public InferenceBackend {
     Status ValidateOutputs(
         const ::google::protobuf::RepeatedPtrField<ModelOutput>& ios);
 
-    // Set an input tensor data from payloads.
+    // Set an input tensor data from requests.
     Status SetInput(
         const std::string& name, const DataType datatype,
         const std::vector<int64_t>& dims, const size_t total_batch_size,
-        std::vector<Scheduler::Payload>* payloads,
+        std::vector<std::unique_ptr<InferenceRequest>>* requests,
         std::vector<InputInfo>* inputs, TRTISTF_TensorList** input_tensors,
         bool* cuda_copy);
 
@@ -102,38 +102,32 @@ class BaseBackend : public InferenceBackend {
     void SetFixedSizedInputTensor(
         TRTISTF_Tensor* tensor, const std::string& input_name,
         const size_t batch1_byte_size,
-        std::vector<Scheduler::Payload>* payloads, InputInfo* input,
+        std::vector<std::unique_ptr<InferenceRequest>>* requests, InputInfo* input,
         bool* cuda_copy);
 
     // Helper function to set the input for String data type
     void SetStringInputTensor(
         TRTISTF_Tensor* tensor, const std::string& input_name,
         const size_t batch1_element_cnt,
-        std::vector<Scheduler::Payload>* payloads);
+        std::vector<std::unique_ptr<InferenceRequest>>* requests);
 
-    // Helper function to set the output with fixed-sized data type in payload
+    // Helper function to set an output with a fixed-sized data type
     void ReadFixedSizedOutputTensor(
         TRTISTF_Tensor* tensor, const std::string& output_name,
         const size_t batch1_byte_size,
-        std::vector<Scheduler::Payload>* payloads, OutputInfo* output,
+        std::vector<std::unique_ptr<InferenceRequest>>* requests, OutputInfo* output,
         bool* cuda_copy);
 
-    // Helper function to set the output with String data type in payload
+    // Helper function to set an output with a BYTES data type
     void ReadStringOutputTensor(
         TRTISTF_Tensor* tensor, const std::string& output_name,
         const std::vector<int64_t>& shape, const size_t batch1_element_cnt,
-        std::vector<Scheduler::Payload>* payloads, bool* cuda_copy);
+        std::vector<std::unique_ptr<InferenceRequest>>* requests, bool* cuda_copy);
 
-    // Run model to execute for one or more requests. This function
-    // assumes that it is only called by the single runner thread that
-    // is assigned to this context. A non-OK return status indicates
-    // an internal error that prevents any of the of requests from
-    // completing. If an error is isolate to a single request payload
-    // it will be reported in that payload.
     // See BackendContext::Run()
-    Status Run(
+    void Run(
         const InferenceBackend* base,
-        std::vector<Scheduler::Payload>* payloads) override;
+        std::vector<std::unique_ptr<InferenceRequest>>&& requests) override;
 
     // Map from configuration name for an input to tensor name for
     // that input in the model.

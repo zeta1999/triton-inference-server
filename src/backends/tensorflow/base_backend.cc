@@ -114,13 +114,13 @@ BaseBackend::CreateExecutionContexts(
       total_context_cnt,
       [](uint32_t runner_idx) -> Status { return Status::Success; },
       [this](
-          uint32_t runner_idx, std::vector<Scheduler::Payload>* payloads,
-          std::function<void(Status)> func) {
-        Run(runner_idx, payloads, func);
+          uint32_t runner_idx,
+          std::vector<std::unique_ptr<InferenceRequest>>&& requests) {
+        Run(runner_idx, std::move(requests));
       },
       [this](
           uint32_t runner_idx, const InferenceRequest::Input& input,
-          const Scheduler::Payload& payload,
+          const std::unique_ptr<InferenceRequest>& request,
           std::vector<int64_t>* shape) -> Status { return Status::Success; }));
 
   LOG_VERBOSE(1) << "backend for " << Name() << std::endl << *this;
@@ -366,7 +366,7 @@ Status
 BaseBackend::Context::SetInput(
     const std::string& name, const DataType datatype,
     const std::vector<int64_t>& dims, const size_t total_batch_size,
-    std::vector<Scheduler::Payload>* payloads, std::vector<InputInfo>* inputs,
+    std::vector<std::unique_ptr<InferenceRequest>>* requests, std::vector<InputInfo>* inputs,
     TRTISTF_TensorList** input_tensors, bool* cuda_copy)
 {
   // Get the shape of the input. The request normalizer has already
@@ -422,9 +422,9 @@ BaseBackend::Context::SetInput(
     }
     inputs->emplace_back();
     SetFixedSizedInputTensor(
-        tensor, name, batch1_byte_size, payloads, &inputs->back(), cuda_copy);
+        tensor, name, batch1_byte_size, requests, &inputs->back(), cuda_copy);
   } else {
-    SetStringInputTensor(tensor, name, batch1_element_cnt, payloads);
+    SetStringInputTensor(tensor, name, batch1_element_cnt, requests);
   }
 
   return Status::Success;
@@ -433,17 +433,16 @@ BaseBackend::Context::SetInput(
 void
 BaseBackend::Context::SetFixedSizedInputTensor(
     TRTISTF_Tensor* tensor, const std::string& input_name,
-    const size_t batch1_byte_size, std::vector<Scheduler::Payload>* payloads,
+    const size_t batch1_byte_size, std::vector<std::unique_ptr<InferenceRequest>>* requests,
     InputInfo* input, bool* cuda_copy)
 {
   input->input_buffer_ = TRTISTF_TensorData(tensor);
 
-  // Visit the payloads in order and copy the input values into the
-  // input tensor. Skip payloads that had errors since they are not
+  // Visit the requests in order and copy the input values into the
+  // input tensor. Skip requests that had errors since they are not
   // included in the dynamic batch.
   std::vector<size_t> expected_byte_sizes;
-  for (auto& payload : *payloads) {
-    const auto& irequest = payload.request_;
+  for (auto& irequest : *requests) {
     expected_byte_sizes.push_back(irequest->BatchSize() * batch1_byte_size);
   }
 
@@ -455,21 +454,20 @@ BaseBackend::Context::SetFixedSizedInputTensor(
   LOG_VERBOSE(1) << "input '" << input_name
                  << "' is GPU tensor: " << TRTISTF_TensorIsGPUTensor(tensor);
   *cuda_copy |=
-      SetInputBuffer(input_name, expected_byte_sizes, payloads, input);
+      SetInputBuffer(input_name, expected_byte_sizes, requests, input);
 }
 
 void
 BaseBackend::Context::SetStringInputTensor(
     TRTISTF_Tensor* tensor, const std::string& input_name,
-    const size_t batch1_element_cnt, std::vector<Scheduler::Payload>* payloads)
+    const size_t batch1_element_cnt, std::vector<std::unique_ptr<InferenceRequest>>* requests)
 {
   size_t tensor_element_idx = 0;
 
-  // Visit the payloads in order and copy the input values into the
-  // input tensor. Skip payloads that had errors since they are not
+  // Visit the requests in order and copy the input values into the
+  // input tensor. Skip requests that had errors since they are not
   // included in the dynamic batch.
-  for (auto& payload : *payloads) {
-    const auto& irequest = payload.request_;
+  for (auto& irequest : *requests) {
     const size_t expected_element_cnt =
         irequest->BatchSize() * batch1_element_cnt;
     size_t element_idx = 0;
@@ -561,7 +559,7 @@ BaseBackend::Context::SetStringInputTensor(
 void
 BaseBackend::Context::ReadFixedSizedOutputTensor(
     TRTISTF_Tensor* tensor, const std::string& output_name,
-    const size_t batch1_byte_size, std::vector<Scheduler::Payload>* payloads,
+    const size_t batch1_byte_size, std::vector<std::unique_ptr<InferenceRequest>>* requests,
     OutputInfo* output, bool* cuda_copy)
 {
   output->output_buffer_ = TRTISTF_TensorData(tensor);
@@ -573,26 +571,24 @@ BaseBackend::Context::ReadFixedSizedOutputTensor(
   LOG_VERBOSE(1) << "output '" << output_name
                  << "' is GPU tensor: " << TRTISTF_TensorIsGPUTensor(tensor);
   *cuda_copy |=
-      SetFixedSizeOutputBuffer(output_name, batch1_byte_size, output, payloads);
+      SetFixedSizeOutputBuffer(output_name, batch1_byte_size, output, requests);
 }
 
 void
 BaseBackend::Context::ReadStringOutputTensor(
     TRTISTF_Tensor* tensor, const std::string& output_name,
     const std::vector<int64_t>& shape, const size_t batch1_element_cnt,
-    std::vector<Scheduler::Payload>* payloads, bool* cuda_copy)
+    std::vector<std::unique_ptr<InferenceRequest>>* requests, bool* cuda_copy)
 {
   size_t tensor_element_idx = 0;
 
-  for (auto& payload : *payloads) {
-    const auto& irequest = payload.request_;
+  for (auto& irequest : *requests) {
     const size_t expected_element_cnt =
         irequest->BatchSize() * batch1_element_cnt;
 
-    // If 'payload' should have valid output (status ok) and
-    // if 'payload' requested this output then copy it from
-    // tensor. If it did not request this output then just
-    // skip it.
+    // If 'irequest' should have valid output (status ok) and if
+    // 'irequest' requested this output then copy it from tensor. If
+    // it did not request this output then just skip it.
     if (payload.status_.IsOk() && (payload.response_provider_ != nullptr) &&
         payload.response_provider_->RequiresOutput(output_name)) {
       // Serialize the output tensor strings. Each string is
@@ -638,36 +634,36 @@ BaseBackend::Context::ReadStringOutputTensor(
 
 Status
 BaseBackend::Context::Run(
-    const InferenceBackend* base, std::vector<Scheduler::Payload>* payloads)
+    const InferenceBackend* base,
+    std::vector<std::unique_ptr<InferenceRequest>>&& requests)
 {
-  LOG_VERBOSE(1) << "Running " << name_ << " with " << payloads->size()
-                 << " request payloads";
+  LOG_VERBOSE(1) << "Running " << name_ << " with " << requests.size()
+                 << " requests";
 
   const InferenceRequest* repr_input_request = nullptr;
 
-  // For each request in 'payloads' collect the total batch size for
-  // this inference execution. The batch-size, number of inputs, and
-  // size of each input has already been checked by each payloads
-  // request normalizer so don't need to do that here.
+  // For each request collect the total batch size for this inference
+  // execution. The batch-size, number of inputs, and size of each
+  // input has already been checked so don't need to do that here.
   size_t total_batch_size = 0;
-  for (auto& payload : *payloads) {
-    if (!payload.status_.IsOk()) {
-      return Status(
-          Status::Code::INTERNAL,
-          "unexpected payload with non-OK status given to runner for '" +
-              name_ + "'");
+  for (auto& request : requests) {
+    if (request == nullptr) {
+      InferenceRequest::RespondWithError(
+          requests,
+          Status(
+              Status::Code::INTERNAL,
+              "null request given to TensorFlow runner for '" + name_ + "'"));
+      return;
     }
 
-    total_batch_size += payload.request_->BatchSize();
+    total_batch_size += request->BatchSize();
 
-    // All payloads must have equally-sized input tensors so use any
-    // payload as the representative for the input tensors.
-    repr_input_request = payload.request_.get();
+    // All requests must have equally-sized input tensors so use any
+    // request as the representative for the input tensors.
+    repr_input_request = request.get();
   }
 
-  // If there are no valid payloads then no need to run the
-  // inference. The payloads will have their error status set so can
-  // just return.
+  // If there are no valid requests then no need to run the inference.
   if (total_batch_size == 0) {
     return Status::Success;
   }
@@ -682,8 +678,8 @@ BaseBackend::Context::Run(
   }
 
   // Create a tensor for each input sized correctly for the total
-  // payload batch size. Concatenate input values from each payload
-  // into the corresponding tensor.
+  //  batch size. Concatenate input values from each request into the
+  //  corresponding tensor.
 
   // Smart pointer is TensorList** as the pointer to input head (TensorList*)
   // will be updated in SetInput()
@@ -704,15 +700,13 @@ BaseBackend::Context::Run(
     const std::string& name = input->Name();
 
     RETURN_IF_ERROR(SetInput(
-        name, input->DType(), input->Shape(), total_batch_size, payloads,
+        name, input->DType(), input->Shape(), total_batch_size, requests,
         &inputs, input_tensors.get(), &cuda_copy));
   }
 
-  // Collect the names of outputs requested by any request
-  // payload.
+  // Collect the names of requested outputs.
   std::set<std::string> required_outputs;
-  for (auto& payload : *payloads) {
-    const auto& irequest = payload.request_;
+  for (auto& irequest : *requests) {
     for (const auto& pr : irequest->RequestedOutputs()) {
       required_outputs.insert(pr.first);
     }
@@ -757,7 +751,7 @@ BaseBackend::Context::Run(
           input.input_buffer_ + std::get<1>(indirect_buffer), stream_,
           &cuda_used);
       if (!status.IsOk()) {
-        for (const auto& payload_idx : std::get<2>(indirect_buffer)) {
+        for (const auto& request_idx : std::get<2>(indirect_buffer)) {
           (*payloads)[payload_idx].status_ = status;
         }
       } else {
@@ -771,7 +765,7 @@ BaseBackend::Context::Run(
 #endif  // TRTIS_ENABLE_GPU
 
 #ifdef TRTIS_ENABLE_STATS
-  for (auto& payload : *payloads) {
+  for (auto& request : *requests) {
     if (payload.stats_ != nullptr) {
       payload.stats_->CaptureTimestamp(
           ModelInferStats::TimestampKind::kComputeInputEnd);
@@ -860,12 +854,12 @@ BaseBackend::Context::Run(
                 std::to_string(batch1_byte_size));
       }
       ReadFixedSizedOutputTensor(
-          output_tensor, name, batch1_byte_size, payloads, &outputs.back(),
+          output_tensor, name, batch1_byte_size, requests, &outputs.back(),
           &cuda_copy);
     } else {
       ReadStringOutputTensor(
           output_tensor, name, outputs.back().output_shape_, batch1_element_cnt,
-          payloads, &cuda_copy);
+          requests, &cuda_copy);
     }
 
     output_tensor_itr = output_tensor_itr->next_;
@@ -887,10 +881,10 @@ BaseBackend::Context::Run(
           0, &src_byte_size, &src_memory_type, &src_memory_type_id);
       TRITONSERVER_MemoryType dst_memory_type;
       int64_t dst_memory_type_id;
-      for (auto& payload_output : indirect_buffer.second) {
-        char* dst = payload_output.second->MutableBuffer(
+      for (auto& request_output : indirect_buffer.second) {
+        char* dst = request_output.second->MutableBuffer(
             &dst_memory_type, &dst_memory_type_id);
-        auto dst_byte_size = payload_output.second->TotalByteSize();
+        auto dst_byte_size = request_output.second->TotalByteSize();
         (*payloads)[payload_output.first].status_ = CopyBuffer(
             "indirect buffer", src_memory_type, src_memory_type_id,
             dst_memory_type, dst_memory_type_id, dst_byte_size, src, dst,
